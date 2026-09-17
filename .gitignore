@@ -1,0 +1,20 @@
+# Python
+backend/.venv
+backend/__pycache__
+backend/**/__pycache__
+*.pyc
+
+# Local runtime state — regenerated automatically (DB via SQLAlchemy migrations
+# + startup backfills, data_cache via registry.refresh_all() on startup)
+backend/intel.db
+backend/data_cache
+
+# Frontend build output / deps
+frontend/node_modules
+frontend/dist
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea

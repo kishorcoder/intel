@@ -1,0 +1,139 @@
+import socket
+from datetime import datetime, timezone
+
+import httpx
+from sqlalchemy.orm import Session
+
+import models
+from services.blocklists import registry, build_ip_security_checks
+from services.domain_utils import registrable_domain
+
+IP_API_FIELDS = (
+    "status,message,country,countryCode,region,regionName,city,timezone,"
+    "isp,org,as,mobile,proxy,hosting,query"
+)
+IP_CACHE_MAX_AGE_HOURS = 24
+
+
+def _fetch_ip_api(ip: str) -> dict:
+    url = f"http://ip-api.com/json/{ip}?fields={IP_API_FIELDS}"
+    resp = httpx.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_rdap(ip: str) -> dict:
+    try:
+        resp = httpx.get(f"https://rdap.org/ip/{ip}", timeout=10, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError:
+        return {}
+
+
+def _reverse_dns(ip: str) -> str | None:
+    """PTR lookup via the system resolver — no external API, keyless by
+    nature. Most residential/cloud IPs have one; plenty of others don't.
+    PTR records are full hostnames (e.g. "ec2-1-2-3-4.compute.amazonaws.com"),
+    so this reduces to just the registrable domain for display — same
+    eTLD+1 logic already used for the RDAP/WHOIS domain lookups."""
+    try:
+        hostname, _aliases, _ips = socket.gethostbyaddr(ip)
+    except (socket.herror, socket.gaierror, UnicodeError):
+        return None
+    return registrable_domain(hostname) or hostname
+
+
+def _rdap_org(rdap: dict) -> str | None:
+    for entity in rdap.get("entities", []):
+        if "registrant" in entity.get("roles", []) or "administrative" in entity.get("roles", []):
+            vcard = entity.get("vcardArray")
+            if vcard and len(vcard) > 1:
+                for field in vcard[1]:
+                    if field[0] == "fn":
+                        return field[3]
+    return None
+
+
+def lookup_ip(db: Session, ip: str, force_refresh: bool = False) -> models.IPLookup:
+    existing = db.query(models.IPLookup).filter(models.IPLookup.ip == ip).first()
+    if existing and not force_refresh:
+        age_hours = (datetime.now(timezone.utc) - existing.fetched_at.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+        if age_hours < IP_CACHE_MAX_AGE_HOURS:
+            return existing
+
+    geo = _fetch_ip_api(ip)
+    rdap = _fetch_rdap(ip)
+    reverse_dns = _reverse_dns(ip)
+    block_result = registry.check_ip(ip)
+
+    lists_checked = block_result["lists_checked"]
+    lists_flagged = block_result["lists_flagged"]
+    score = round((lists_flagged / lists_checked) * 100, 1) if lists_checked else 0.0
+
+    row = existing or models.IPLookup(ip=ip)
+    row.isp = geo.get("isp")
+    row.org = geo.get("org")
+    row.asn = geo.get("as")
+    row.country = geo.get("country")
+    row.country_code = geo.get("countryCode")
+    row.city = geo.get("city")
+    row.region = geo.get("regionName")
+    row.timezone = geo.get("timezone")
+    row.is_proxy = bool(geo.get("proxy")) or block_result["is_anon_proxy"]
+    row.is_vpn = block_result["is_vpn"]
+    row.is_hosting = bool(geo.get("hosting"))
+    row.is_tor = block_result["is_tor"]
+    row.is_mobile = bool(geo.get("mobile"))
+    row.malicious_score = score
+    row.lists_checked = lists_checked
+    row.lists_flagged = lists_flagged
+    row.blocklist_hits = block_result["hits"]
+    row.security_checks = build_ip_security_checks(block_result["hits"])
+    row.rdap_org = _rdap_org(rdap)
+    row.rdap_network = rdap.get("name")
+    row.reverse_dns = reverse_dns
+    row.raw_source_json = {"ip_api": geo}
+    row.fetched_at = datetime.now(timezone.utc)
+
+    if not existing:
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def backfill_security_checks(db: Session) -> int:
+    """Catch-up for rows cached before `security_checks` (or is_vpn/blocklist
+    fields added alongside it) existed. Every value here derives from the
+    already-stored IP plus the in-memory blocklists, so it's a pure recompute
+    — no external calls, safe to run on every startup."""
+    rows = db.query(models.IPLookup).filter(models.IPLookup.security_checks.is_(None)).all()
+    for row in rows:
+        block_result = registry.check_ip(row.ip)
+        lists_checked = block_result["lists_checked"]
+        lists_flagged = block_result["lists_flagged"]
+        row.is_proxy = row.is_proxy or block_result["is_anon_proxy"]
+        row.is_vpn = block_result["is_vpn"]
+        row.malicious_score = round((lists_flagged / lists_checked) * 100, 1) if lists_checked else 0.0
+        row.lists_checked = lists_checked
+        row.lists_flagged = lists_flagged
+        row.blocklist_hits = block_result["hits"]
+        row.security_checks = build_ip_security_checks(block_result["hits"])
+    if rows:
+        db.commit()
+    return len(rows)
+
+
+def backfill_reverse_dns(db: Session) -> int:
+    """Recomputes reverse_dns for every row on every startup — deliberately
+    unconditional, not just IS NULL. DNS lookups are fast and row counts here
+    are small, and this way any future change to the PTR-reduction logic (or
+    a PTR record that gets added/changed after the fact) self-heals on the
+    next restart instead of needing yet another one-off backfill."""
+    rows = db.query(models.IPLookup).all()
+    for row in rows:
+        row.reverse_dns = _reverse_dns(row.ip)
+    if rows:
+        db.commit()
+    return len(rows)
